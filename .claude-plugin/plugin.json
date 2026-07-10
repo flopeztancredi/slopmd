@@ -1,0 +1,10 @@
+{
+  "name": "slopmd",
+  "description": "The markdown doctor for AI-written code. Diagnose, treat, and prevent AI slop.",
+  "version": "0.1.0",
+  "skills": [
+    "./skills/diagnose",
+    "./skills/treat",
+    "./skills/check-dep"
+  ]
+}

@@ -1,0 +1,1025 @@
+#!/usr/bin/env node
+import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const MAX_FILE_BYTES = 1024 * 1024;
+const MAX_SNIPPET_LENGTH = 100;
+const MAX_FINDINGS_SHOWN_PER_RULE = 10;
+const SUPPRESSION_MARKER = 'slopmd-ignore';
+
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', 'dist', 'build', 'out', 'vendor', 'venv', '.venv',
+  '__pycache__', 'coverage', '.next', 'target',
+]);
+const LOCKFILES = new Set([
+  'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock', 'Cargo.lock',
+]);
+const ALLOWED_EXTENSIONS = new Set([
+  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'py', 'rb', 'go', 'rs', 'java', 'kt',
+  'cs', 'php', 'swift', 'c', 'h', 'cpp', 'hpp', 'sh', 'sql', 'html', 'css',
+  'scss', 'vue', 'svelte', 'md', 'mdx', 'json', 'yaml', 'yml', 'toml',
+]);
+const REQUIREMENTS_FILE_RE = /^requirements(-[\w.]+)?\.txt$/;
+const MINIFIED_FILE_RE = /\.min\./;
+
+const SEVERITIES = ['critical', 'high', 'medium', 'low'];
+const SEVERITY_RANK = { critical: 3, high: 2, medium: 1, low: 0 };
+const SEVERITY_WEIGHT = { critical: 25, high: 8, medium: 3, low: 1 };
+const SEVERITY_CAP = { critical: 40, high: 24, medium: 15, low: 8 };
+const BASE_SCORE = 100;
+const HEALTHY_MIN_SCORE = 90;
+const MILD_MIN_SCORE = 75;
+const CHRONIC_MIN_SCORE = 50;
+const VERDICT_HEALTHY = 'Healthy';
+const VERDICT_MILD = 'Mild symptoms';
+const VERDICT_CHRONIC = 'Chronic slop';
+const VERDICT_CRITICAL = 'Critical condition';
+
+const MARKDOWN_EXTS = new Set(['md', 'mdx']);
+const DATA_EXTS = new Set(['json', 'yaml', 'yml', 'toml']);
+const JS_EXTS = new Set(['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'vue', 'svelte']);
+const TS_EXTS = new Set(['ts', 'tsx']);
+const BRACE_CATCH_EXTS = new Set([
+  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'java', 'kt', 'cs', 'php', 'swift', 'vue', 'svelte',
+]);
+const BRACE_FUNCTION_EXTS = new Set([
+  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'go', 'rs', 'java', 'kt', 'cs', 'php',
+  'swift', 'c', 'h', 'cpp', 'hpp', 'vue', 'svelte',
+]);
+const NO_NESTING_EXTS = new Set(['md', 'mdx', 'json', 'yaml', 'yml', 'html']);
+const HASH_COMMENT_EXTS = new Set(['py', 'rb', 'sh', 'yaml', 'yml', 'toml']);
+const SLASH_COMMENT_EXTS = new Set([
+  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'go', 'rs', 'java', 'kt', 'cs', 'php',
+  'swift', 'c', 'h', 'cpp', 'hpp', 'css', 'scss', 'vue', 'svelte',
+]);
+const DASH_COMMENT_EXTS = new Set(['sql']);
+
+const AWS_KEY_RE = /AKIA[0-9A-Z]{16}/;
+const GITHUB_TOKEN_RE = /gh[pousr]_[A-Za-z0-9]{36,}/;
+const API_SECRET_KEY_RE = /sk-[A-Za-z0-9_-]{20,}/;
+const SLACK_TOKEN_RE = /xox[bap]-/;
+const PRIVATE_KEY_RE = /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/;
+const SECRET_TOKEN_PATTERNS = [
+  { label: 'AWS access key', re: AWS_KEY_RE },
+  { label: 'GitHub token', re: GITHUB_TOKEN_RE },
+  { label: 'API secret key', re: API_SECRET_KEY_RE },
+  { label: 'Slack token', re: SLACK_TOKEN_RE },
+  { label: 'private key block', re: PRIVATE_KEY_RE },
+];
+const GENERIC_SECRET_RE = /(password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?key)\s*[:=]\s*["']([^"'\s]{8,})["']/i;
+const SECRET_LINE_EXCLUSION_RES = [/process\.env/i, /os\.environ/i, /getenv/i, /^\s*(?:import|from)\s/, /\brequire\s*\(/];
+const SECRET_PLACEHOLDER_MARKERS = ['example', 'changeme', 'placeholder', 'xxx', 'dummy', 'your-', '<'];
+const SECRET_TEST_PATH_RE = /(^|[/._-])(tests?|specs?|fixtures?|examples?|mocks?)([/._-]|$)/;
+
+const DEPENDENCY_SECTIONS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
+const LOOSE_VERSION_RE = /^[\^~>*]/;
+
+const PY_BARE_EXCEPT_RE = /^\s*except\s*:/;
+const PY_BROAD_EXCEPT_RE = /^\s*except\s+\(?\s*Exception\b/;
+const PASS_LOOKAHEAD_LINES = 2;
+const EMPTY_CATCH_RE = /^catch\s*(\([^)]*\))?\s*\{\s*\}/;
+const BROAD_CATCH_RE = /^catch\s*\(\s*(final\s+)?(System\.)?Exception\b/;
+const CATCH_KEYWORD_RE = /\bcatch\b/;
+const EMPTY_PROMISE_CATCH_RE = /\.catch\(\s*(?:\(\s*[\w$]*\s*\)|[\w$]+)?\s*=>\s*\{\s*\}\s*\)|\.catch\(\s*function\s*\([^)]*\)\s*\{\s*\}\s*\)/;
+
+const TS_ANY_RE = /:\s*any\b|\bas\s+any\b|<any>/;
+const TS_DIRECTIVE_RE = /@ts-(ignore|nocheck)\b/;
+const PY_TYPE_IGNORE_RE = /#\s*type:\s*ignore\b/;
+
+const EMOJI_RE = /[\u{1F000}-\u{1F0FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/u;
+const TYPOGRAPHIC_RE = /[\u2013\u2014\u00B7\u2018-\u201D\u2026]/;
+const TYPOGRAPHIC_NAMES = new Map([
+  ['\u2013', 'en dash'],
+  ['\u2014', 'em dash'],
+  ['\u00B7', 'middle dot'],
+  ['\u2026', 'ellipsis'],
+]);
+const TYPOGRAPHIC_FALLBACK_NAME = 'curly quote';
+
+const MAX_FUNCTION_BODY_LINES = 75;
+const FUNCTION_BRACE_SEARCH_LINES = 3;
+const MAX_FUNCTION_SIGNATURE_CHARS = 500;
+const PY_DEF_RE = /^([ \t]*)(?:async\s+)?def\s+\w+/;
+const FUNCTION_START_PATTERNS = [
+  /\bfunction\b\s*\*?\s*[\w$]*\s*\(/,
+  /^\s*(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s+)?(?:\([^()]*\)|[\w$]+)\s*=>/,
+  /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+\w+/,
+  /^\s*func\s+/,
+  /^\s*(?:(?:public|private|protected|internal|static|final|abstract|override|async|export|default)\s+)+[\w<>[\], ]*\w\s+\w+\s*\([^;{}]*\)\s*\{/,
+  /^\s*(?:async\s+)?[\w$]+\s*\([^;{}]*\)\s*\{\s*$/,
+];
+const CONTROL_FLOW_RE = /^\s*(?:if|else|for|while|switch|catch|do|try|return)\b/;
+
+const DEEP_NESTING_MIN_LEVEL = 5;
+const DEEP_NESTING_MIN_RUN = 3;
+const INDENT_SPACES_PER_LEVEL = 4;
+
+const COMMENT_RUN_MIN_LINES = 4;
+const COMMENT_RUN_MIN_CODELIKE = 3;
+const CODELIKE_END_RE = /[;{}),]$/;
+const CODELIKE_START_RE = /^(if|for|while|return|const|let|var|import|def|class|function)\b/;
+
+const CONSOLE_DEBUG_RE = /\bconsole\.(log|debug)\s*\(/;
+const JS_DEBUG_EXEMPT_PATH_RE = /(^|[/._-])(tests?|specs?|scripts?|cli|bin)([/._-]|$)/;
+const PY_PRINT_RE = /^[ \t]*print\(/;
+const PY_DEBUG_EXEMPT_PATH_RE = /(^|[/._-])(tests?|cli|main|scripts?)([/._-]|$)/;
+const PY_PRINT_MAX_INDENT_LEVEL = 1;
+
+const TODO_RE = /\b(TODO|FIXME)\b/;
+const ISSUE_REF_RE = /#\d+/;
+const URL_REF_RE = /https?:\/\//;
+const OWNER_REF_RE = /\([A-Za-z][^)]*\)/;
+
+const AI_TELL_PHRASES = [
+  'as requested',
+  'in a real app',
+  'in a real application',
+  'in production, you would',
+  'in production you would',
+  'for demonstration purposes',
+  'this is a simple implementation',
+  'feel free to',
+  'you can customize',
+  'your logic here',
+  'left as an exercise',
+  'note: adjust as needed',
+];
+const PY_DOCSTRING_QUOTE_RE = /"""|'''/g;
+
+const MARKETING_RE = /\b(comprehensive|seamless|seamlessly|robust|leverage|delve|cutting-edge|state-of-the-art|revolutionize|supercharge|game-changing)\b/i;
+
+const NARRATION_PREFIXES = [
+  'increment', 'decrement', 'loop over', 'iterate over', 'set the', 'get the',
+  'return the', 'create a new', 'initialize the', 'call the', 'check if the',
+];
+
+const MAGIC_NUMBER_RE = /(?<![\w.])\d{2,}(?![\w.])/g;
+const ALLOWED_NUMBERS = new Set(['10', '100', '1000', '1024', '60', '24', '365']);
+const CONSTANT_LINE_RE = /^\s*(?:export\s+)?(?:(?:public|private|protected|internal)\s+)?(?:(?:static|final|readonly|const)\s+)+[^;=]*=|^\s*[A-Z][A-Z0-9_]+\s*[:=]|^\s*(?:export\s+)?enum\b/;
+const MAX_MAGIC_FINDINGS_PER_FILE = 5;
+const TEST_PATH_RE = /(^|[/._-])(tests?|specs?)([/._-]|$)/;
+
+const HTTP_URL_RE = /http:\/\/[^\s"'`<>)]*/;
+const HTTP_URL_ALLOWLIST = ['localhost', '127.0.0.1', '0.0.0.0', 'example.com', 'w3.org'];
+
+const ANSI_CODES = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+};
+const SEVERITY_COLORS = { critical: 'red', high: 'magenta', medium: 'yellow', low: 'cyan' };
+
+const USAGE = [
+  'Usage: labs.js [path] [--json] [--diff [gitref]] [--min-severity low|medium|high|critical] [--fail-under N]',
+  '',
+  '  --json                  emit { score, verdict, stats, findings } as JSON',
+  '  --diff [gitref]         scan only files changed since gitref (default HEAD)',
+  '  --min-severity <level>  drop findings below this severity',
+  '  --fail-under <n>        exit 1 if the slop score is below n',
+].join('\n');
+
+function isGitRepo(root) {
+  try {
+    const output = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return output.trim() === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function gitList(root, args) {
+  const output = execFileSync('git', [...args, '-z'], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return output.split('\0').filter(Boolean);
+}
+
+function walkDir(root, relDir, acc = []) {
+  let entries;
+  try {
+    entries = readdirSync(join(root, relDir || '.'), { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    const rel = relDir ? relDir + '/' + entry.name : entry.name;
+    if (entry.isDirectory()) {
+      if (!SKIP_DIRS.has(entry.name)) walkDir(root, rel, acc);
+      continue;
+    }
+    if (entry.isFile() || entry.isSymbolicLink()) acc.push(rel);
+  }
+  return acc;
+}
+
+function listCandidates(root, options) {
+  if (options.diff) {
+    if (!isGitRepo(root)) throw new Error('--diff requires a git repository');
+    const ref = options.diffRef || 'HEAD';
+    try {
+      return gitList(root, ['diff', '--name-only', '--relative', ref]);
+    } catch {
+      throw new Error("git ref '" + ref + "' not found; fetch it or check the name");
+    }
+  }
+  if (isGitRepo(root)) return gitList(root, ['ls-files', '-co', '--exclude-standard']);
+  return walkDir(root, '');
+}
+
+function hasAllowedExtension(base) {
+  if (REQUIREMENTS_FILE_RE.test(base)) return true;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return ALLOWED_EXTENSIONS.has(base.slice(dot + 1).toLowerCase());
+}
+
+function isEligible(root, rel) {
+  const segments = rel.split('/');
+  if (segments.some((segment) => SKIP_DIRS.has(segment))) return false;
+  const base = segments[segments.length - 1];
+  if (LOCKFILES.has(base)) return false;
+  if (MINIFIED_FILE_RE.test(base)) return false;
+  if (!hasAllowedExtension(base)) return false;
+  let stat;
+  try {
+    stat = statSync(join(root, rel));
+  } catch {
+    return false;
+  }
+  return stat.isFile() && stat.size <= MAX_FILE_BYTES;
+}
+
+function fileExt(base) {
+  const dot = base.lastIndexOf('.');
+  return dot <= 0 ? '' : base.slice(dot + 1).toLowerCase();
+}
+
+function inlineCommentMarkers(ext) {
+  if (HASH_COMMENT_EXTS.has(ext)) return ['#'];
+  if (SLASH_COMMENT_EXTS.has(ext)) return ['//', '/*'];
+  if (DASH_COMMENT_EXTS.has(ext)) return ['--'];
+  if (ext === 'html' || MARKDOWN_EXTS.has(ext)) return ['<!--'];
+  return [];
+}
+
+function fullLineMarkers(ext) {
+  if (SLASH_COMMENT_EXTS.has(ext)) return ['//', '/*', '*'];
+  return inlineCommentMarkers(ext);
+}
+
+function fullLineCommentText(line, ext) {
+  const trimmed = line.trimStart();
+  for (const marker of fullLineMarkers(ext)) {
+    if (trimmed.startsWith(marker)) return trimmed.slice(marker.length).trim();
+  }
+  return null;
+}
+
+function lineCommentIndex(line, ext) {
+  const trimmed = line.trimStart();
+  if (SLASH_COMMENT_EXTS.has(ext) && trimmed.startsWith('*')) {
+    return line.length - trimmed.length;
+  }
+  let best = -1;
+  for (const marker of inlineCommentMarkers(ext)) {
+    const idx = line.indexOf(marker);
+    if (idx !== -1 && (best === -1 || idx < best)) best = idx;
+  }
+  return best;
+}
+
+function indentLevel(line) {
+  const ws = /^[\t ]*/.exec(line)[0];
+  let tabs = 0;
+  let spaces = 0;
+  for (const ch of ws) {
+    if (ch === '\t') tabs += 1;
+    else spaces += 1;
+  }
+  return tabs + Math.floor(spaces / INDENT_SPACES_PER_LEVEL);
+}
+
+function suppressedLines(ctx) {
+  const suppressed = new Set();
+  for (let i = 0; i < ctx.lines.length; i++) {
+    if (!ctx.lines[i].includes(SUPPRESSION_MARKER)) continue;
+    suppressed.add(i + 1);
+    if (fullLineCommentText(ctx.lines[i], ctx.ext) !== null) suppressed.add(i + 2);
+  }
+  return suppressed;
+}
+
+function matchSecret(line) {
+  for (const { label, re } of SECRET_TOKEN_PATTERNS) {
+    const m = re.exec(line);
+    if (m) return { label, value: m[0] };
+  }
+  const g = GENERIC_SECRET_RE.exec(line);
+  if (g) return { label: g[1].toLowerCase() + ' value', value: g[2] };
+  return null;
+}
+
+function detectHardcodedSecrets(ctx, report) {
+  const severity = SECRET_TEST_PATH_RE.test(ctx.pathLower) ? 'medium' : 'critical';
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    if (SECRET_LINE_EXCLUSION_RES.some((re) => re.test(line))) continue;
+    const hit = matchSecret(line);
+    if (!hit) continue;
+    if (SECRET_PLACEHOLDER_MARKERS.some((marker) => hit.value.toLowerCase().includes(marker))) continue;
+    report('hardcoded-secret', severity, i, 'Possible hardcoded ' + hit.label);
+  }
+}
+
+function detectUnpinnedPackageJson(ctx, report) {
+  let pkg;
+  try {
+    pkg = JSON.parse(ctx.lines.join('\n'));
+  } catch {
+    return;
+  }
+  const seenLines = new Set();
+  for (const section of DEPENDENCY_SECTIONS) {
+    const deps = pkg[section];
+    if (!deps || typeof deps !== 'object') continue;
+    for (const [name, version] of Object.entries(deps)) {
+      if (typeof version !== 'string') continue;
+      if (!LOOSE_VERSION_RE.test(version) && version !== 'latest') continue;
+      const found = ctx.lines.findIndex(
+        (line, n) => !seenLines.has(n) && line.includes('"' + name + '"') && line.includes(version),
+      );
+      const lineIdx = found === -1 ? 0 : found;
+      seenLines.add(lineIdx);
+      report('unpinned-dependency', 'high', lineIdx, 'Unpinned dependency ' + name + ': "' + version + '"');
+    }
+  }
+}
+
+function detectUnpinnedRequirements(ctx, report) {
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const trimmed = ctx.lines[i].trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('-')) continue;
+    if (trimmed.includes('://') || trimmed.includes('==')) continue;
+    const name = trimmed.split(/[\s<>=!~;[]/)[0];
+    report('unpinned-dependency', 'high', i, 'Unpinned requirement: ' + name);
+  }
+}
+
+function detectUnpinnedDependencies(ctx, report) {
+  if (ctx.base === 'package.json') return detectUnpinnedPackageJson(ctx, report);
+  if (REQUIREMENTS_FILE_RE.test(ctx.base)) return detectUnpinnedRequirements(ctx, report);
+}
+
+function nextMeaningfulIsPass(lines, i) {
+  const last = Math.min(lines.length - 1, i + PASS_LOOKAHEAD_LINES);
+  for (let j = i + 1; j <= last; j++) {
+    const trimmed = lines[j].trim();
+    if (!trimmed) continue;
+    return trimmed === 'pass' || trimmed.startsWith('pass ') || trimmed.startsWith('pass#');
+  }
+  return false;
+}
+
+function detectPythonBroadCatch(ctx, report) {
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    if (PY_BARE_EXCEPT_RE.test(line)) {
+      report('broad-catch', 'high', i, 'Bare except clause swallows all errors');
+      continue;
+    }
+    if (!PY_BROAD_EXCEPT_RE.test(line)) continue;
+    if (nextMeaningfulIsPass(ctx.lines, i)) {
+      report('broad-catch', 'high', i, 'except Exception followed by pass');
+    } else {
+      report('broad-catch', 'medium', i, 'Broad except Exception clause');
+    }
+  }
+}
+
+function detectBroadCatch(ctx, report) {
+  if (ctx.ext === 'py') return detectPythonBroadCatch(ctx, report);
+  if (!BRACE_CATCH_EXTS.has(ctx.ext)) return;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const idx = ctx.lines[i].search(CATCH_KEYWORD_RE);
+    if (idx === -1) continue;
+    const wide = ctx.lines[i] + '\n' + (ctx.lines[i + 1] ?? '');
+    if (EMPTY_PROMISE_CATCH_RE.test(wide)) {
+      report('broad-catch', 'high', i, 'Empty promise catch swallows errors');
+      continue;
+    }
+    const window = wide.slice(idx);
+    if (EMPTY_CATCH_RE.test(window)) {
+      report('broad-catch', 'high', i, 'Empty catch block swallows errors');
+      continue;
+    }
+    if (BROAD_CATCH_RE.test(window)) {
+      report('broad-catch', 'medium', i, 'Catches broad Exception type');
+    }
+  }
+}
+
+function detectTypeSuppression(ctx, report) {
+  if (TS_EXTS.has(ctx.ext)) {
+    for (let i = 0; i < ctx.lines.length; i++) {
+      const line = ctx.lines[i];
+      if (TS_DIRECTIVE_RE.test(line)) {
+        report('type-suppression', 'medium', i, 'TypeScript checking suppressed by directive');
+        continue;
+      }
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
+      const commentStart = line.indexOf('//');
+      const code = commentStart === -1 ? line : line.slice(0, commentStart);
+      if (TS_ANY_RE.test(code)) {
+        report('type-suppression', 'medium', i, 'any defeats type checking');
+      }
+    }
+    return;
+  }
+  if (ctx.ext !== 'py') return;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    if (PY_TYPE_IGNORE_RE.test(ctx.lines[i])) {
+      report('type-suppression', 'medium', i, 'type: ignore suppresses the type checker');
+    }
+  }
+}
+
+function detectEmoji(ctx, report) {
+  const severity = ctx.isMarkdown ? 'low' : 'medium';
+  for (let i = 0; i < ctx.lines.length; i++) {
+    if (EMOJI_RE.test(ctx.lines[i])) {
+      report('emoji', severity, i, 'Emoji character (keep output plain ASCII)');
+    }
+  }
+}
+
+function detectTypographicPunctuation(ctx, report) {
+  const severity = ctx.isMarkdown ? 'low' : 'medium';
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const m = TYPOGRAPHIC_RE.exec(ctx.lines[i]);
+    if (!m) continue;
+    const name = TYPOGRAPHIC_NAMES.get(m[0]) ?? TYPOGRAPHIC_FALLBACK_NAME;
+    report('typographic-punctuation', severity, i, 'Typographic ' + name + ' (use plain ASCII)');
+  }
+}
+
+function pythonLongFunctions(ctx, report) {
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const m = PY_DEF_RE.exec(ctx.lines[i]);
+    if (!m) continue;
+    const defLevel = indentLevel(ctx.lines[i]);
+    let end = i;
+    for (let j = i + 1; j < ctx.lines.length; j++) {
+      if (!ctx.lines[j].trim()) continue;
+      if (indentLevel(ctx.lines[j]) <= defLevel) break;
+      end = j;
+    }
+    const bodyLines = end - i;
+    if (bodyLines > MAX_FUNCTION_BODY_LINES) {
+      report('long-function', 'medium', i, 'Function body spans ' + bodyLines + ' lines (threshold ' + MAX_FUNCTION_BODY_LINES + ')');
+    }
+  }
+}
+
+function findOpeningBrace(lines, startIdx) {
+  const last = Math.min(lines.length - 1, startIdx + FUNCTION_BRACE_SEARCH_LINES - 1);
+  for (let j = startIdx; j <= last; j++) {
+    const col = lines[j].indexOf('{');
+    if (col !== -1) return { line: j, col };
+  }
+  return null;
+}
+
+function findClosingBrace(lines, brace) {
+  let depth = 0;
+  for (let j = brace.line; j < lines.length; j++) {
+    const text = j === brace.line ? lines[j].slice(brace.col) : lines[j];
+    for (const ch of text) {
+      if (ch === '{') depth += 1;
+      if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) return j;
+      }
+    }
+  }
+  return -1;
+}
+
+function braceLongFunctions(ctx, report) {
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    if (line.length > MAX_FUNCTION_SIGNATURE_CHARS) continue;
+    if (CONTROL_FLOW_RE.test(line)) continue;
+    if (!FUNCTION_START_PATTERNS.some((re) => re.test(line))) continue;
+    const brace = findOpeningBrace(ctx.lines, i);
+    if (!brace) continue;
+    const end = findClosingBrace(ctx.lines, brace);
+    if (end === -1) continue;
+    const bodyLines = end - i - 1;
+    if (bodyLines > MAX_FUNCTION_BODY_LINES) {
+      report('long-function', 'medium', i, 'Function body spans ' + bodyLines + ' lines (threshold ' + MAX_FUNCTION_BODY_LINES + ')');
+    }
+  }
+}
+
+function detectLongFunctions(ctx, report) {
+  if (ctx.ext === 'py') return pythonLongFunctions(ctx, report);
+  if (BRACE_FUNCTION_EXTS.has(ctx.ext)) return braceLongFunctions(ctx, report);
+}
+
+function detectDeepNesting(ctx, report) {
+  if (NO_NESTING_EXTS.has(ctx.ext)) return;
+  let runStart = -1;
+  let runLength = 0;
+  const flush = () => {
+    if (runLength >= DEEP_NESTING_MIN_RUN) {
+      report('deep-nesting', 'medium', runStart, runLength + ' consecutive lines nested ' + DEEP_NESTING_MIN_LEVEL + '+ levels deep');
+    }
+    runStart = -1;
+    runLength = 0;
+  };
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    if (!line.trim() || indentLevel(line) < DEEP_NESTING_MIN_LEVEL) {
+      flush();
+      continue;
+    }
+    if (runStart === -1) runStart = i;
+    runLength += 1;
+  }
+  flush();
+}
+
+function looksLikeCode(commentText) {
+  return CODELIKE_END_RE.test(commentText) || CODELIKE_START_RE.test(commentText);
+}
+
+function detectCommentedOutCode(ctx, report) {
+  if (ctx.isMarkdown) return;
+  let runStart = -1;
+  let runLength = 0;
+  let codeLike = 0;
+  const flush = () => {
+    if (runLength >= COMMENT_RUN_MIN_LINES && codeLike >= COMMENT_RUN_MIN_CODELIKE) {
+      report('commented-out-code', 'low', runStart, runLength + ' consecutive comment lines look like disabled code');
+    }
+    runStart = -1;
+    runLength = 0;
+    codeLike = 0;
+  };
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const content = fullLineCommentText(ctx.lines[i], ctx.ext);
+    if (content === null) {
+      flush();
+      continue;
+    }
+    if (runStart === -1) runStart = i;
+    runLength += 1;
+    if (looksLikeCode(content)) codeLike += 1;
+  }
+  flush();
+}
+
+function detectDebugLeftover(ctx, report) {
+  if (JS_EXTS.has(ctx.ext) && !JS_DEBUG_EXEMPT_PATH_RE.test(ctx.pathLower)) {
+    for (let i = 0; i < ctx.lines.length; i++) {
+      if (fullLineCommentText(ctx.lines[i], ctx.ext) !== null) continue;
+      if (CONSOLE_DEBUG_RE.test(ctx.lines[i])) {
+        report('debug-leftover', 'medium', i, 'console.log/debug left outside test or CLI code');
+      }
+    }
+    return;
+  }
+  if (ctx.ext !== 'py' || PY_DEBUG_EXEMPT_PATH_RE.test(ctx.pathLower)) return;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    if (!PY_PRINT_RE.test(line)) continue;
+    if (indentLevel(line) > PY_PRINT_MAX_INDENT_LEVEL) continue;
+    report('debug-leftover', 'low', i, 'print() left outside test or CLI code');
+  }
+}
+
+function detectUnreferencedTodos(ctx, report) {
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    const m = TODO_RE.exec(line);
+    if (!m) continue;
+    const commentIdx = lineCommentIndex(line, ctx.ext);
+    if (commentIdx === -1 || m.index < commentIdx) continue;
+    const rest = line.slice(m.index);
+    if (ISSUE_REF_RE.test(rest) || URL_REF_RE.test(rest) || OWNER_REF_RE.test(rest)) continue;
+    report('todo-no-ref', 'low', i, m[1] + ' without an issue reference or owner');
+  }
+}
+
+function detectAiTellComments(ctx, report) {
+  let inDocstring = false;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    let inCommentContext = lineCommentIndex(line, ctx.ext) !== -1;
+    if (ctx.ext === 'py') {
+      const quoteHits = (line.match(PY_DOCSTRING_QUOTE_RE) ?? []).length;
+      if (inDocstring || quoteHits > 0) inCommentContext = true;
+      if (quoteHits % 2 === 1) inDocstring = !inDocstring;
+    }
+    if (!inCommentContext) continue;
+    const lower = line.toLowerCase();
+    const phrase = AI_TELL_PHRASES.find((p) => lower.includes(p));
+    if (!phrase) continue;
+    report('ai-tell-comment', 'medium', i, 'AI filler phrase: "' + phrase + '"');
+  }
+}
+
+function detectMarketingProse(ctx, report) {
+  if (!ctx.isMarkdown) return;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const m = MARKETING_RE.exec(ctx.lines[i]);
+    if (m) report('marketing-prose', 'low', i, 'Marketing word "' + m[1].toLowerCase() + '"');
+  }
+}
+
+function detectNarrationComments(ctx, report) {
+  for (let i = 0; i < ctx.lines.length - 1; i++) {
+    const content = fullLineCommentText(ctx.lines[i], ctx.ext);
+    if (content === null) continue;
+    const lower = content.toLowerCase();
+    const prefix = NARRATION_PREFIXES.find((p) => lower.startsWith(p));
+    if (!prefix) continue;
+    const next = ctx.lines[i + 1];
+    if (!next.trim() || fullLineCommentText(next, ctx.ext) !== null) continue;
+    report('narration-comment', 'low', i, 'Comment narrates the next line ("' + prefix + ' ...")');
+  }
+}
+
+function bracketBalance(line) {
+  let balance = 0;
+  for (const ch of line) {
+    if (ch === '{' || ch === '[' || ch === '(') balance += 1;
+    else if (ch === '}' || ch === ']' || ch === ')') balance -= 1;
+  }
+  return balance;
+}
+
+function detectMagicNumbers(ctx, report) {
+  if (DATA_EXTS.has(ctx.ext) || ctx.isMarkdown) return;
+  if (TEST_PATH_RE.test(ctx.pathLower)) return;
+  let findingsInFile = 0;
+  let constantBlockDepth = 0;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    if (constantBlockDepth > 0) {
+      constantBlockDepth = Math.max(0, constantBlockDepth + bracketBalance(line));
+      continue;
+    }
+    if (fullLineCommentText(line, ctx.ext) !== null) continue;
+    if (CONSTANT_LINE_RE.test(line)) {
+      constantBlockDepth = Math.max(0, bracketBalance(line));
+      continue;
+    }
+    const numbers = [...line.matchAll(MAGIC_NUMBER_RE)]
+      .map((m) => m[0])
+      .filter((n) => !ALLOWED_NUMBERS.has(n));
+    if (numbers.length === 0) continue;
+    const extra = numbers.length > 1 ? ' (+' + (numbers.length - 1) + ' more on this line)' : '';
+    report('magic-number', 'low', i, 'Magic number ' + numbers[0] + extra + '; name it as a constant');
+    findingsInFile += 1;
+    if (findingsInFile >= MAX_MAGIC_FINDINGS_PER_FILE) return;
+  }
+}
+
+function detectHttpUrls(ctx, report) {
+  if (ctx.isMarkdown) return;
+  for (let i = 0; i < ctx.lines.length; i++) {
+    const line = ctx.lines[i];
+    const m = HTTP_URL_RE.exec(line);
+    if (!m) continue;
+    const host = m[0].toLowerCase().slice('http://'.length).split(/[/:?#]/, 1)[0];
+    if (!host) continue;
+    if (HTTP_URL_ALLOWLIST.some((allowed) => host === allowed || host.endsWith('.' + allowed))) continue;
+    if (line.includes('xmlns')) continue;
+    report('http-url', 'low', i, 'Insecure plain-http URL');
+  }
+}
+
+const RULES = [
+  detectHardcodedSecrets,
+  detectUnpinnedDependencies,
+  detectBroadCatch,
+  detectTypeSuppression,
+  detectEmoji,
+  detectTypographicPunctuation,
+  detectLongFunctions,
+  detectDeepNesting,
+  detectCommentedOutCode,
+  detectDebugLeftover,
+  detectUnreferencedTodos,
+  detectAiTellComments,
+  detectMarketingProse,
+  detectNarrationComments,
+  detectMagicNumbers,
+  detectHttpUrls,
+];
+
+function scanFile(root, rel) {
+  let text;
+  try {
+    text = readFileSync(join(root, rel), 'utf8');
+  } catch {
+    return null;
+  }
+  if (text.includes('\u0000')) return null;
+  const lines = text.split(/\r?\n/);
+  const base = basename(rel);
+  const ctx = {
+    file: rel,
+    base,
+    ext: fileExt(base),
+    lines,
+    pathLower: rel.toLowerCase(),
+    isMarkdown: MARKDOWN_EXTS.has(fileExt(base)),
+  };
+  const findings = [];
+  const report = (rule, severity, lineIdx, message) => {
+    findings.push({
+      rule,
+      severity,
+      file: rel,
+      line: lineIdx + 1,
+      message,
+      snippet: (lines[lineIdx] ?? '').trim().slice(0, MAX_SNIPPET_LENGTH),
+    });
+  };
+  for (const rule of RULES) rule(ctx, report);
+  const suppressed = suppressedLines(ctx);
+  return {
+    findings: findings.filter((f) => !suppressed.has(f.line)),
+    loc: lines.filter((line) => line.trim().length > 0).length,
+  };
+}
+
+function computeScore(findings) {
+  const groupCounts = new Map();
+  for (const f of findings) {
+    const key = f.rule + '|' + f.severity;
+    groupCounts.set(key, (groupCounts.get(key) ?? 0) + 1);
+  }
+  let deduction = 0;
+  for (const [key, count] of groupCounts) {
+    const severity = key.split('|')[1];
+    deduction += Math.min(SEVERITY_CAP[severity], count * SEVERITY_WEIGHT[severity]);
+  }
+  return Math.max(0, BASE_SCORE - deduction);
+}
+
+function verdictFor(score) {
+  if (score >= HEALTHY_MIN_SCORE) return VERDICT_HEALTHY;
+  if (score >= MILD_MIN_SCORE) return VERDICT_MILD;
+  if (score >= CHRONIC_MIN_SCORE) return VERDICT_CHRONIC;
+  return VERDICT_CRITICAL;
+}
+
+function buildStats(filesScanned, linesOfCode, findings) {
+  const bySeverity = { critical: 0, high: 0, medium: 0, low: 0 };
+  const byRule = {};
+  for (const f of findings) {
+    bySeverity[f.severity] += 1;
+    byRule[f.rule] = (byRule[f.rule] ?? 0) + 1;
+  }
+  return {
+    filesScanned,
+    linesOfCode,
+    totalFindings: findings.length,
+    findingsBySeverity: bySeverity,
+    findingsByRule: byRule,
+  };
+}
+
+function sortFindings(findings) {
+  return findings.sort(
+    (a, b) =>
+      SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
+      a.file.localeCompare(b.file) ||
+      a.line - b.line,
+  );
+}
+
+/**
+ * Scan a directory (or single file) for slop findings.
+ *
+ * @param {object} [options]
+ * @param {string} [options.path] Directory or file to scan; defaults to cwd.
+ * @param {boolean} [options.diff] Restrict to files changed since options.diffRef.
+ * @param {string} [options.diffRef] Git ref for --diff mode; defaults to HEAD.
+ * @param {string} [options.minSeverity] Drop findings below this severity.
+ * @returns {{ score: number, verdict: string, stats: object, findings: object[] }}
+ */
+export function scan(options = {}) {
+  const target = resolve(options.path ?? process.cwd());
+  const stat = statSync(target);
+  const root = stat.isFile() ? dirname(target) : target;
+  const candidates = stat.isFile() ? [basename(target)] : listCandidates(root, options);
+  const files = candidates
+    .map((rel) => rel.replace(/\\/g, '/'))
+    .filter((rel) => isEligible(root, rel));
+  let findings = [];
+  let filesScanned = 0;
+  let linesOfCode = 0;
+  for (const rel of files) {
+    const result = scanFile(root, rel);
+    if (!result) continue;
+    filesScanned += 1;
+    linesOfCode += result.loc;
+    findings.push(...result.findings);
+  }
+  sortFindings(findings);
+  const score = computeScore(findings);
+  let visible = findings;
+  if (options.minSeverity) {
+    const minRank = SEVERITY_RANK[options.minSeverity];
+    visible = findings.filter((f) => SEVERITY_RANK[f.severity] >= minRank);
+  }
+  return {
+    score,
+    verdict: verdictFor(score),
+    stats: buildStats(filesScanned, linesOfCode, visible),
+    findings: visible,
+  };
+}
+
+function makePainter(enabled) {
+  if (!enabled) return (_color, text) => text;
+  return (color, text) => ANSI_CODES[color] + text + ANSI_CODES.reset;
+}
+
+function scoreColor(score) {
+  if (score >= HEALTHY_MIN_SCORE) return 'green';
+  if (score >= MILD_MIN_SCORE) return 'yellow';
+  return 'red';
+}
+
+function groupByRule(findings) {
+  const groups = new Map();
+  for (const f of findings) {
+    if (!groups.has(f.rule)) groups.set(f.rule, []);
+    groups.get(f.rule).push(f);
+  }
+  return groups;
+}
+
+function formatFindingGroups(findings, paint) {
+  const lines = [];
+  for (const severity of SEVERITIES) {
+    const bySeverity = findings.filter((f) => f.severity === severity);
+    if (bySeverity.length === 0) continue;
+    lines.push(paint(SEVERITY_COLORS[severity], severity.toUpperCase()) + ' (' + bySeverity.length + ')');
+    for (const [rule, items] of groupByRule(bySeverity)) {
+      lines.push('  ' + rule);
+      for (const f of items.slice(0, MAX_FINDINGS_SHOWN_PER_RULE)) {
+        lines.push('    ' + f.file + ':' + f.line + '  ' + f.message);
+      }
+      const hidden = items.length - MAX_FINDINGS_SHOWN_PER_RULE;
+      if (hidden > 0) lines.push('    ... and ' + hidden + ' more');
+    }
+    lines.push('');
+  }
+  lines.pop();
+  return lines;
+}
+
+/**
+ * Render a scan result as a plain-text clinical report.
+ *
+ * @param {object} result Return value of scan().
+ * @param {object} [options]
+ * @param {boolean} [options.color] Emit ANSI colors.
+ * @returns {string}
+ */
+function pluralize(count, word) {
+  return count + ' ' + word + (count === 1 ? '' : 's');
+}
+
+export function formatReport(result, options = {}) {
+  const paint = makePainter(options.color === true);
+  const { stats } = result;
+  const out = [];
+  out.push(paint('bold', 'SLOPMD LAB RESULTS'));
+  out.push('==================');
+  out.push('');
+  out.push('Scanned ' + pluralize(stats.filesScanned, 'file') + ', ' + pluralize(stats.linesOfCode, 'line') + ' of code.');
+  out.push('');
+  if (result.findings.length === 0) {
+    out.push('No slop detected. The patient is in excellent shape.');
+  } else {
+    out.push(...formatFindingGroups(result.findings, paint));
+  }
+  out.push('');
+  const summary = SEVERITIES.map((s) => stats.findingsBySeverity[s] + ' ' + s).join(', ');
+  out.push('Summary: ' + summary + ' (' + stats.totalFindings + ' total)');
+  out.push('');
+  out.push(paint(scoreColor(result.score), 'SLOP SCORE: ' + result.score + '/100 (' + result.verdict + ')'));
+  return out.join('\n');
+}
+
+/**
+ * Parse labs CLI arguments.
+ *
+ * @param {string[]} argv Arguments after the script name.
+ * @returns {object} Options accepted by scan() plus json, failUnder, help.
+ */
+export function parseLabArgs(argv) {
+  const opts = {
+    path: undefined,
+    json: false,
+    diff: false,
+    diffRef: 'HEAD',
+    minSeverity: undefined,
+    failUnder: undefined,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--json') {
+      opts.json = true;
+    } else if (arg === '--help' || arg === '-h') {
+      opts.help = true;
+    } else if (arg === '--diff') {
+      opts.diff = true;
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        opts.diffRef = next;
+        i += 1;
+      }
+    } else if (arg === '--min-severity') {
+      const value = argv[++i];
+      if (!SEVERITIES.includes(value)) throw new Error('invalid --min-severity: ' + value);
+      opts.minSeverity = value;
+    } else if (arg === '--fail-under') {
+      const value = Number(argv[++i]);
+      if (!Number.isFinite(value)) throw new Error('--fail-under requires a number');
+      opts.failUnder = value;
+    } else if (!arg.startsWith('-') && opts.path === undefined) {
+      opts.path = arg;
+    } else {
+      throw new Error('unknown argument: ' + arg);
+    }
+  }
+  return opts;
+}
+
+/**
+ * Run the labs CLI: parse argv, scan, print, and return an exit code.
+ *
+ * @param {string[]} argv Arguments after the script name.
+ * @returns {number} Process exit code.
+ */
+export function runLabs(argv) {
+  let opts;
+  try {
+    opts = parseLabArgs(argv);
+  } catch (err) {
+    console.error('slopmd: ' + err.message);
+    console.error(USAGE);
+    return 2;
+  }
+  if (opts.help) {
+    console.log(USAGE);
+    return 0;
+  }
+  let result;
+  try {
+    result = scan(opts);
+  } catch (err) {
+    console.error('slopmd: ' + err.message);
+    return 2;
+  }
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(formatReport(result, { color: process.stdout.isTTY === true }));
+  }
+  if (opts.failUnder !== undefined && result.score < opts.failUnder) return 1;
+  return 0;
+}
+
+function argvIsThisModule(argPath) {
+  try {
+    return realpathSync(argPath) === fileURLToPath(import.meta.url);
+  } catch {
+    return resolve(argPath) === fileURLToPath(import.meta.url);
+  }
+}
+
+const isMainModule = process.argv[1] && argvIsThisModule(process.argv[1]);
+if (isMainModule) process.exit(runLabs(process.argv.slice(2)));

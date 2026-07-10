@@ -1,0 +1,42 @@
+{
+  "name": "slopmd",
+  "version": "0.1.0",
+  "description": "The markdown doctor for AI-written code. Diagnose, treat, and prevent AI slop in any codebase, with any coding agent.",
+  "type": "module",
+  "bin": {
+    "slopmd": "bin/slopmd.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "skills",
+    "prevent",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ai-slop",
+    "code-quality",
+    "agent-skills",
+    "claude-code",
+    "cursor",
+    "codex",
+    "copilot",
+    "linter",
+    "code-review",
+    "clean-code"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flopeztancredi/slopmd.git"
+  },
+  "author": "Francisco Lopez Tancredi <flopezt@fi.uba.ar> (https://github.com/flopeztancredi)",
+  "bugs": {
+    "url": "https://github.com/flopeztancredi/slopmd/issues"
+  },
+  "homepage": "https://github.com/flopeztancredi/slopmd#readme"
+}
