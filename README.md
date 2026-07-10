@@ -2,6 +2,12 @@
 
 **The markdown doctor for AI-written code.**
 
+[![npm](https://img.shields.io/npm/v/slopmd?color=cb3837&logo=npm)](https://www.npmjs.com/package/slopmd)
+[![Slop Score](https://img.shields.io/badge/slop_score-100%2F100-9ece6a)](#why-an-agent-finds-what-a-linter-cannot)
+[![node](https://img.shields.io/badge/node-%3E%3D18-5fa04e?logo=node.js&logoColor=white)](package.json)
+[![zero dependencies](https://img.shields.io/badge/dependencies-0-9ece6a)](package.json)
+[![license](https://img.shields.io/badge/license-MIT-bb9af7)](LICENSE)
+
 Your coding agent writes slop: narrated comments, wrapper classes around nothing, swallowed exceptions, `any` casts, emoji in logs, hallucinated packages, secrets in source. SlopMD diagnoses it, treats it, and prevents it.
 
 Works with Claude Code, Cursor, Codex, Copilot, Windsurf, Gemini CLI, and any agent that speaks [Agent Skills](https://agentskills.io).
@@ -10,7 +16,11 @@ Works with Claude Code, Cursor, Codex, Copilot, Windsurf, Gemini CLI, and any ag
 npx slopmd
 ```
 
-Ten seconds, no install, no config: a lab scan of your repo and a **Slop Score** out of 100. Real output on a small demo repo:
+Ten seconds, no install, no config: a lab scan of your repo and a **Slop Score** out of 100.
+
+![SlopMD scanning a demo repo](assets/demo.gif)
+
+That output is real, not a mockup:
 
 ```
 SLOPMD LAB RESULTS
