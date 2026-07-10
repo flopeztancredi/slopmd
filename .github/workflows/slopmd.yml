@@ -1,0 +1,17 @@
+name: slopmd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  self-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: SlopMD scans itself
+        run: node bin/slopmd.js . --fail-under 100
