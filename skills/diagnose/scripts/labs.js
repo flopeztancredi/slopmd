@@ -71,6 +71,7 @@ const SECRET_TOKEN_PATTERNS = [
 const GENERIC_SECRET_RE = /(password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?key)\s*[:=]\s*["']([^"'\s]{8,})["']/i;
 const SECRET_LINE_EXCLUSION_RES = [/process\.env/i, /os\.environ/i, /getenv/i, /^\s*(?:import|from)\s/, /\brequire\s*\(/];
 const SECRET_PLACEHOLDER_MARKERS = ['example', 'changeme', 'placeholder', 'xxx', 'dummy', 'your-', '<'];
+const SECRET_REFERENCE_RE = /^(?:\{\{.*\}\}|\$\{.*\}|%\(.*\)s|\$[A-Za-z_][A-Za-z0-9_]*|<%=?.*%>)$/;
 const SECRET_TEST_PATH_RE = /(^|[/._-])(tests?|specs?|fixtures?|examples?|mocks?)([/._-]|$)/;
 
 const DEPENDENCY_SECTIONS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
@@ -338,6 +339,7 @@ function detectHardcodedSecrets(ctx, report) {
     if (SECRET_LINE_EXCLUSION_RES.some((re) => re.test(line))) continue;
     const hit = matchSecret(line);
     if (!hit) continue;
+    if (SECRET_REFERENCE_RE.test(hit.value.trim())) continue;
     if (SECRET_PLACEHOLDER_MARKERS.some((marker) => hit.value.toLowerCase().includes(marker))) continue;
     report('hardcoded-secret', severity, i, 'Possible hardcoded ' + hit.label);
   }
