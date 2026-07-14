@@ -8,6 +8,7 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SNIPPET_LENGTH = 100;
 const MAX_FINDINGS_SHOWN_PER_RULE = 10;
 const SUPPRESSION_MARKER = 'slopmd-ignore';
+const SUPPRESSION_MAX_STATEMENT_LINES = 10;
 
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', 'out', 'vendor', 'venv', '.venv',
@@ -325,12 +326,46 @@ function indentLevel(line) {
   return tabs + Math.floor(spaces / INDENT_SPACES_PER_LEVEL);
 }
 
+function nextCodeLine(ctx, from) {
+  for (let j = from; j < ctx.lines.length; j++) {
+    if (!ctx.lines[j].trim()) continue;
+    if (fullLineCommentText(ctx.lines[j], ctx.ext) !== null) continue;
+    return j;
+  }
+  return -1;
+}
+
+function opensBlock(line, ext) {
+  if (ext === 'py') return PY_DEF_RE.test(line) || /:\s*$/.test(line);
+  return CONTROL_FLOW_RE.test(line) || FUNCTION_START_PATTERNS.some((re) => re.test(line));
+}
+
+/**
+ * Lines covered by a suppression that sits above `start`: the statement itself, plus any
+ * continuation lines while its brackets stay open. A statement that opens a block (a function,
+ * an if) is not followed in: suppressing one finding must not silence a whole body.
+ */
+function statementSpan(ctx, start) {
+  const span = [start];
+  if (opensBlock(ctx.lines[start], ctx.ext)) return span;
+  let depth = bracketBalance(ctx.lines[start]);
+  for (let j = start + 1; depth > 0 && j < ctx.lines.length; j++) {
+    if (span.length >= SUPPRESSION_MAX_STATEMENT_LINES) break;
+    span.push(j);
+    depth += bracketBalance(ctx.lines[j]);
+  }
+  return span;
+}
+
 function suppressedLines(ctx) {
   const suppressed = new Set();
   for (let i = 0; i < ctx.lines.length; i++) {
     if (!ctx.lines[i].includes(SUPPRESSION_MARKER)) continue;
     suppressed.add(i + 1);
-    if (fullLineCommentText(ctx.lines[i], ctx.ext) !== null) suppressed.add(i + 2);
+    if (fullLineCommentText(ctx.lines[i], ctx.ext) === null) continue;
+    const target = nextCodeLine(ctx, i + 1);
+    if (target === -1) continue;
+    for (const line of statementSpan(ctx, target)) suppressed.add(line + 1);
   }
   return suppressed;
 }

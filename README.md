@@ -111,7 +111,20 @@ Your build fails on slop the change introduced, never on the backlog you inherit
 
 ## Suppressing a finding
 
-Add `slopmd-ignore` in a comment on or above the line. Use it for the exceptions that prove the rule, not as a lifestyle.
+Add `slopmd-ignore` in a comment on the flagged line, or anywhere in the comment block above it. The suppression covers the whole statement that follows, so it still lands when the line the scanner blames sits inside a multi-line expression:
+
+```tsx
+<script
+  // El catch vacio es deliberado: si el registro del service worker falla,
+  // la app tiene que seguir andando igual. Es una mejora, no un requisito.
+  // slopmd-ignore
+  dangerouslySetInnerHTML={{
+    __html: "...navigator.serviceWorker.register('/sw.js').catch(function(){})",
+  }}
+/>
+```
+
+It does not reach into a block body: above a function or an `if`, it suppresses that line alone, never the code inside. Use it for the exceptions that prove the rule, not as a lifestyle.
 
 ## Token budget
 
