@@ -16,7 +16,7 @@ const HELP_TEXT = [
   '',
   'Scan options:',
   '  --json                  emit { score, verdict, stats, findings } as JSON',
-  '  --diff [gitref]         scan only files changed since gitref (default HEAD)',
+  '  --diff [gitref]         scan only files changed since the merge-base with gitref (default HEAD)',
   '  --min-severity <level>  low | medium | high | critical',
   '  --fail-under <n>        exit 1 if the slop score is below n',
 ].join('\n');

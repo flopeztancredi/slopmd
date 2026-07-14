@@ -180,7 +180,7 @@ const USAGE = [
   'Usage: labs.js [path] [--json] [--diff [gitref]] [--min-severity low|medium|high|critical] [--fail-under N]',
   '',
   '  --json                  emit { score, verdict, stats, findings } as JSON',
-  '  --diff [gitref]         scan only files changed since gitref (default HEAD)',
+  '  --diff [gitref]         scan only files changed since the merge-base with gitref (default HEAD)',
   '  --min-severity <level>  drop findings below this severity',
   '  --fail-under <n>        exit 1 if the slop score is below n',
 ].join('\n');
@@ -207,6 +207,19 @@ function gitList(root, args) {
   return output.split('\0').filter(Boolean);
 }
 
+function mergeBase(root, ref) {
+  try {
+    const output = execFileSync('git', ['merge-base', ref, 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return output.trim();
+  } catch {
+    return ref;
+  }
+}
+
 function walkDir(root, relDir, acc = []) {
   let entries;
   try {
@@ -230,7 +243,7 @@ function listCandidates(root, options) {
     if (!isGitRepo(root)) throw new Error('--diff requires a git repository');
     const ref = options.diffRef || 'HEAD';
     try {
-      return gitList(root, ['diff', '--name-only', '--relative', ref]);
+      return gitList(root, ['diff', '--name-only', '--relative', mergeBase(root, ref)]);
     } catch {
       throw new Error("git ref '" + ref + "' not found; fetch it or check the name");
     }
@@ -822,7 +835,7 @@ function sortFindings(findings) {
  *
  * @param {object} [options]
  * @param {string} [options.path] Directory or file to scan; defaults to cwd.
- * @param {boolean} [options.diff] Restrict to files changed since options.diffRef.
+ * @param {boolean} [options.diff] Restrict to files changed since the merge-base with options.diffRef.
  * @param {string} [options.diffRef] Git ref for --diff mode; defaults to HEAD.
  * @param {string} [options.minSeverity] Drop findings below this severity.
  * @returns {{ score: number, verdict: string, stats: object, findings: object[] }}
