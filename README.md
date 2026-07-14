@@ -111,7 +111,38 @@ Your build fails on slop the change introduced, never on the backlog you inherit
 
 ## Suppressing a finding
 
-Add `slopmd-ignore` in a comment on or above the line. Use it for the exceptions that prove the rule, not as a lifestyle.
+Add `slopmd-ignore` in a comment on the flagged line, or anywhere in the comment block above it. It covers the statement that follows, so it still lands when the line the scanner blames sits inside a multi-line expression:
+
+```tsx
+<script
+  // El catch vacio es deliberado: si el registro del service worker falla,
+  // la app tiene que seguir andando igual. Es una mejora, no un requisito.
+  // slopmd-ignore
+  dangerouslySetInnerHTML={{
+    __html: "...navigator.serviceWorker.register('/sw.js').catch(function(){})",
+  }}
+/>
+```
+
+It never reaches into a block body. Above a function, an `if`, or a callback (`useEffect(() => {`), it suppresses that line alone and nothing inside. One exception you accept must not silence findings you never saw.
+
+Use it for the exceptions that prove the rule, not as a lifestyle.
+
+## Configuration
+
+None required. Generated files are skipped, and `magic-number` reads HTTP status codes as themselves when they sit next to a status, so `err.status === 404` is not a finding while `setTimeout(fn, 500)` still is.
+
+For numbers that are self-describing in *your* domain, add an optional `.slopmd.json` at the repo root. It is found by searching upward, so scanning a single file obeys the same config as scanning the repo:
+
+```json
+{
+  "magic-number": {
+    "ignore": [7350, 32]
+  }
+}
+```
+
+These are added to the built-in defaults, never replace them. Anything malformed, a mistyped key included, fails the run rather than scanning with rules you did not ask for.
 
 ## Token budget
 
