@@ -113,6 +113,22 @@ Your build fails on slop the change introduced, never on the backlog you inherit
 
 Add `slopmd-ignore` in a comment on or above the line. Use it for the exceptions that prove the rule, not as a lifestyle.
 
+## Configuration
+
+None required. `magic-number` already allows HTTP status codes, common time constants, and powers of two, so `404` and `32` do not get reported as unnamed.
+
+For numbers that are self-describing in *your* domain, add an optional `.slopmd.json` at the repo root:
+
+```json
+{
+  "magic-number": {
+    "ignore": [7350, 999]
+  }
+}
+```
+
+These are added to the built-in defaults, never replace them. `86400000` buried in a business calculation is still a finding, which is where the rule earns its keep.
+
 ## Token budget
 
 Skills load progressively per the Agent Skills spec: ~100 tokens of metadata per skill at rest, the skill body only when invoked, and each guideline category only when the examination needs it. The always-on prevention layer is ~650 tokens. Your context is treated like the scarce resource it is.

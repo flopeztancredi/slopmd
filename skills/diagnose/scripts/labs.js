@@ -8,6 +8,7 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SNIPPET_LENGTH = 100;
 const MAX_FINDINGS_SHOWN_PER_RULE = 10;
 const SUPPRESSION_MARKER = 'slopmd-ignore';
+const CONFIG_FILE = '.slopmd.json';
 
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', 'out', 'vendor', 'venv', '.venv',
@@ -157,7 +158,18 @@ const NARRATION_PREFIXES = [
 ];
 
 const MAGIC_NUMBER_RE = /(?<![\w.])\d{2,}(?![\w.])/g;
-const ALLOWED_NUMBERS = new Set(['10', '100', '1000', '1024', '60', '24', '365']);
+const HTTP_STATUS_NUMBERS = [
+  '200', '201', '202', '204', '301', '302', '304', '400', '401', '403', '404',
+  '405', '409', '410', '422', '429', '500', '502', '503', '504',
+];
+const TIME_NUMBERS = ['12', '24', '30', '60', '365', '1000', '3600', '86400'];
+const POWER_OF_TWO_NUMBERS = ['16', '32', '64', '128', '256', '512', '1024', '2048', '4096'];
+const ALLOWED_NUMBERS = new Set([
+  '10', '100',
+  ...HTTP_STATUS_NUMBERS,
+  ...TIME_NUMBERS,
+  ...POWER_OF_TWO_NUMBERS,
+]);
 const CONSTANT_LINE_RE = /^\s*(?:export\s+)?(?:(?:public|private|protected|internal)\s+)?(?:(?:static|final|readonly|const)\s+)+[^;=]*=|^\s*[A-Z][A-Z0-9_]+\s*[:=]|^\s*(?:export\s+)?enum\b/;
 const MAX_MAGIC_FINDINGS_PER_FILE = 5;
 const TEST_PATH_RE = /(^|[/._-])(tests?|specs?)([/._-]|$)/;
@@ -184,6 +196,33 @@ const USAGE = [
   '  --min-severity <level>  drop findings below this severity',
   '  --fail-under <n>        exit 1 if the slop score is below n',
 ].join('\n');
+
+/**
+ * Read the optional .slopmd.json at the scan root. Numbers listed under
+ * magic-number.ignore are added to the built-in allowlist, never replace it.
+ * A malformed config is an error: silently scanning with the wrong rules is worse
+ * than failing loudly.
+ */
+function loadConfig(root) {
+  let text;
+  try {
+    text = readFileSync(join(root, CONFIG_FILE), 'utf8');
+  } catch {
+    return { allowedNumbers: ALLOWED_NUMBERS };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(CONFIG_FILE + ' is not valid JSON: ' + err.message);
+  }
+  const ignore = parsed?.['magic-number']?.ignore;
+  if (ignore === undefined) return { allowedNumbers: ALLOWED_NUMBERS };
+  if (!Array.isArray(ignore) || ignore.some((n) => !Number.isFinite(n))) {
+    throw new Error(CONFIG_FILE + ': magic-number.ignore must be an array of numbers');
+  }
+  return { allowedNumbers: new Set([...ALLOWED_NUMBERS, ...ignore.map(String)]) };
+}
 
 function isGitRepo(root) {
   try {
@@ -705,7 +744,7 @@ function detectMagicNumbers(ctx, report) {
     }
     const numbers = [...line.matchAll(MAGIC_NUMBER_RE)]
       .map((m) => m[0])
-      .filter((n) => !ALLOWED_NUMBERS.has(n));
+      .filter((n) => !ctx.allowedNumbers.has(n));
     if (numbers.length === 0) continue;
     const extra = numbers.length > 1 ? ' (+' + (numbers.length - 1) + ' more on this line)' : '';
     report('magic-number', 'low', i, 'Magic number ' + numbers[0] + extra + '; name it as a constant');
@@ -747,7 +786,7 @@ const RULES = [
   detectHttpUrls,
 ];
 
-function scanFile(root, rel) {
+function scanFile(root, rel, config) {
   let text;
   try {
     text = readFileSync(join(root, rel), 'utf8');
@@ -764,6 +803,7 @@ function scanFile(root, rel) {
     lines,
     pathLower: rel.toLowerCase(),
     isMarkdown: MARKDOWN_EXTS.has(fileExt(base)),
+    allowedNumbers: config.allowedNumbers,
   };
   const findings = [];
   const report = (rule, severity, lineIdx, message) => {
@@ -844,6 +884,7 @@ export function scan(options = {}) {
   const target = resolve(options.path ?? process.cwd());
   const stat = statSync(target);
   const root = stat.isFile() ? dirname(target) : target;
+  const config = loadConfig(root);
   const candidates = stat.isFile() ? [basename(target)] : listCandidates(root, options);
   const files = candidates
     .map((rel) => rel.replace(/\\/g, '/'))
@@ -852,7 +893,7 @@ export function scan(options = {}) {
   let filesScanned = 0;
   let linesOfCode = 0;
   for (const rel of files) {
-    const result = scanFile(root, rel);
+    const result = scanFile(root, rel, config);
     if (!result) continue;
     filesScanned += 1;
     linesOfCode += result.loc;
