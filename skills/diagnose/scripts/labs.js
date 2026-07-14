@@ -116,6 +116,11 @@ const CONTROL_FLOW_RE = /^\s*(?:if|else|for|while|switch|catch|do|try|return)\b/
 const DEEP_NESTING_MIN_LEVEL = 5;
 const DEEP_NESTING_MIN_RUN = 3;
 const INDENT_SPACES_PER_LEVEL = 4;
+const NESTING_BLOCK_RE = /^\s*(?:\}\s*)?(?:if|elif|else|for|while|switch|catch|do|try|with)\b/;
+
+const JSX_EXTS = new Set(['jsx', 'tsx', 'vue', 'svelte']);
+const JSX_TAG_OPEN_RE = /^<\/?[A-Za-z>]/;
+const JSX_TAG_CLOSE_RE = /\/?>$/;
 
 const COMMENT_RUN_MIN_LINES = 4;
 const COMMENT_RUN_MIN_CODELIKE = 3;
@@ -325,6 +330,18 @@ function indentLevel(line) {
   return tabs + Math.floor(spaces / INDENT_SPACES_PER_LEVEL);
 }
 
+/**
+ * Raw indent column. Nesting depth compares one line against another rather than against a
+ * fixed step, so it must not round: at a 2-space step, indentLevel() collapses every level
+ * to 0 and the block stack unwinds itself.
+ */
+function indentColumn(line) {
+  const ws = /^[\t ]*/.exec(line)[0];
+  let column = 0;
+  for (const ch of ws) column += ch === '\t' ? INDENT_SPACES_PER_LEVEL : 1;
+  return column;
+}
+
 function suppressedLines(ctx) {
   const suppressed = new Set();
   for (let i = 0; i < ctx.lines.length; i++) {
@@ -532,7 +549,32 @@ function findClosingBrace(lines, brace) {
   return -1;
 }
 
+/**
+ * Body size in lines of logic: markup is skipped. A component that returns 120 lines of
+ * JSX is not the defect a 120-line function with 8 branches is, and splitting it into
+ * <PartA/> <PartB/> to satisfy a line count produces worse code.
+ */
+function logicLineCount(ctx, from, to) {
+  let count = 0;
+  let insideTag = false;
+  for (let i = from; i <= to; i++) {
+    const trimmed = ctx.lines[i].trim();
+    if (!trimmed) continue;
+    if (insideTag) {
+      if (JSX_TAG_CLOSE_RE.test(trimmed)) insideTag = false;
+      continue;
+    }
+    if (JSX_TAG_OPEN_RE.test(trimmed)) {
+      if (!JSX_TAG_CLOSE_RE.test(trimmed)) insideTag = true;
+      continue;
+    }
+    count += 1;
+  }
+  return count;
+}
+
 function braceLongFunctions(ctx, report) {
+  const isJsx = JSX_EXTS.has(ctx.ext);
   for (let i = 0; i < ctx.lines.length; i++) {
     const line = ctx.lines[i];
     if (line.length > MAX_FUNCTION_SIGNATURE_CHARS) continue;
@@ -542,10 +584,10 @@ function braceLongFunctions(ctx, report) {
     if (!brace) continue;
     const end = findClosingBrace(ctx.lines, brace);
     if (end === -1) continue;
-    const bodyLines = end - i - 1;
-    if (bodyLines > MAX_FUNCTION_BODY_LINES) {
-      report('long-function', 'medium', i, 'Function body spans ' + bodyLines + ' lines (threshold ' + MAX_FUNCTION_BODY_LINES + ')');
-    }
+    const bodyLines = isJsx ? logicLineCount(ctx, i + 1, end - 1) : end - i - 1;
+    if (bodyLines <= MAX_FUNCTION_BODY_LINES) continue;
+    const unit = isJsx ? ' lines of logic, excluding markup (threshold ' : ' lines (threshold ';
+    report('long-function', 'medium', i, 'Function body spans ' + bodyLines + unit + MAX_FUNCTION_BODY_LINES + ')');
   }
 }
 
@@ -554,8 +596,21 @@ function detectLongFunctions(ctx, report) {
   if (BRACE_FUNCTION_EXTS.has(ctx.ext)) return braceLongFunctions(ctx, report);
 }
 
+function opensNestingBlock(line, ext) {
+  if (NESTING_BLOCK_RE.test(line)) return true;
+  if (ext === 'py') return PY_DEF_RE.test(line);
+  return FUNCTION_START_PATTERNS.some((re) => re.test(line));
+}
+
+/**
+ * Nesting depth is the count of enclosing control-flow blocks, not the indent column.
+ * A <div> inside a <Card>, or a key inside a nested config object, costs the reader
+ * nothing: it is a tree, and it reads top to bottom. Branching is what has to be held
+ * in the head, so only branching counts.
+ */
 function detectDeepNesting(ctx, report) {
   if (NO_NESTING_EXTS.has(ctx.ext)) return;
+  const openBlocks = [];
   let runStart = -1;
   let runLength = 0;
   const flush = () => {
@@ -567,7 +622,15 @@ function detectDeepNesting(ctx, report) {
   };
   for (let i = 0; i < ctx.lines.length; i++) {
     const line = ctx.lines[i];
-    if (!line.trim() || indentLevel(line) < DEEP_NESTING_MIN_LEVEL) {
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+    const indent = indentColumn(line);
+    while (openBlocks.length > 0 && indent <= openBlocks[openBlocks.length - 1]) openBlocks.pop();
+    const depth = openBlocks.length;
+    if (opensNestingBlock(line, ctx.ext)) openBlocks.push(indent);
+    if (depth < DEEP_NESTING_MIN_LEVEL) {
       flush();
       continue;
     }
